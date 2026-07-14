@@ -3,11 +3,8 @@ import cors from 'cors';
 import morgan from 'morgan';
 import { requireDemoToken } from './middleware/auth.js';
 import { prisma } from './lib/prisma.js';
-import { loadSeedWorkflows } from './bootstrap/seed.js';
 
 export async function createApp() {
-  await loadSeedWorkflows();
-
   const app = express();
   app.use(cors());
   app.use(express.json());

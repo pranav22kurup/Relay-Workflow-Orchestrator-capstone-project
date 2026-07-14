@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { prisma } from '../lib/prisma.js';
+import { loadNodeCatalog } from './catalog.js';
 
 type SeedWorkflow = {
   id: string;
@@ -21,10 +22,15 @@ function seedPath(fileName: string): string {
 }
 
 export async function loadSeedWorkflows(): Promise<void> {
+  await loadNodeCatalog();
+
   const raw = await readFile(seedPath('seed_workflows.json'), 'utf8');
   const parsed = JSON.parse(raw) as SeedFile;
 
   for (const workflow of parsed.workflows) {
+    const existing = await prisma.workflow.findUnique({ where: { id: workflow.id } });
+    const definition = JSON.stringify(workflow);
+
     await prisma.workflow.upsert({
       where: { id: workflow.id },
       create: {
@@ -32,14 +38,26 @@ export async function loadSeedWorkflows(): Promise<void> {
         name: workflow.name,
         description: workflow.description,
         status: 'published',
-        definition: JSON.stringify(workflow)
+        definition
       },
       update: {
         name: workflow.name,
         description: workflow.description,
         status: 'published',
-        definition: JSON.stringify(workflow)
+        definition
       }
     });
+
+    if (existing && existing.definition !== definition) {
+      await prisma.workflow.update({
+        where: { id: workflow.id },
+        data: {
+          name: workflow.name,
+          description: workflow.description,
+          status: 'published',
+          definition
+        }
+      });
+    }
   }
 }
