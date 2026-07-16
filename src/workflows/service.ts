@@ -122,3 +122,106 @@ export async function publishWorkflow(workflowId: string) {
 
   return toResponse(published as WorkflowRecord);
 }
+
+/**
+ * Validates a webhook secret against the workflow's trigger configuration.
+ * Returns true if secret matches, false otherwise.
+ */
+export async function validateSecret(
+  workflowId: string,
+  providedSecret: string
+): Promise<boolean> {
+  const workflow = await prisma.workflow.findUnique({
+    where: { id: workflowId }
+  });
+
+  // Workflow not found → secret is invalid
+  if (!workflow) {
+    return false;
+  }
+
+  const definition = parseDefinition(workflow.definition);
+  const workflowSecret = definition.trigger?.secret;
+
+  // No secret configured → cannot match
+  if (!workflowSecret) {
+    return false;
+  }
+
+  // Optional: Use constant-time comparison to prevent timing attacks
+  // For MVP, simple equality is fine
+  return workflowSecret === providedSecret;
+}
+
+/**
+ * Triggers a workflow run.
+ * - Validates workflow exists and is published
+ * - Creates a Run record with definition snapshot
+ * - Enqueues a job for the worker
+ * - Returns the run ID
+ */
+export async function triggerWorkflow(
+  workflowId: string,
+  triggerInput: unknown,
+  triggerType: 'manual' | 'webhook' = 'manual'
+): Promise<{ run_id: string }> {
+  // Step 1: Load the workflow
+  const workflow = await prisma.workflow.findUnique({
+    where: { id: workflowId }
+  });
+
+  if (!workflow) {
+    throw new ApiError(404, 'workflow_not_found', `Workflow '${workflowId}' not found`);
+  }
+
+  // Step 2: Check that it's published (only published workflows can be triggered)
+  if (workflow.status !== 'published') {
+    throw new ApiError(
+      409,
+      'workflow_not_published',
+      `Workflow '${workflowId}' is ${workflow.status}, not published`
+    );
+  }
+
+  // Step 3: Parse the workflow definition from the snapshot
+  const definition = parseDefinition(workflow.definition);
+
+  // Step 4: Create a Run record
+  // - definitionSnapshot: the entire workflow definition at trigger time
+  // - input: the trigger body/input JSON
+  // - status: starts as 'queued' (worker will move to 'running')
+  // - currentNodeId: set to the entry node (where execution starts)
+  // - triggerType: 'manual' or 'webhook'
+  const run = await prisma.run.create({
+    data: {
+      workflowId,
+      triggerType,
+      definitionSnapshot: workflow.definition, // SNAPSHOT: immutable
+      input: JSON.stringify(triggerInput), // Store input as JSON string
+      status: 'queued',
+      currentNodeId: definition.entry, // Which node to execute first
+      stepsExecuted: 0,
+      aiTokensUsed: 0,
+      startedAt: new Date()
+    }
+  });
+
+  // Step 5: Enqueue a job for the worker to pick up
+  // The worker will see this job and start executing the run
+  await prisma.queueJob.create({
+    data: {
+      type: 'run_step', // Type of job (used by worker on Day 5)
+      status: 'queued', // Not yet picked up by worker
+      payload: JSON.stringify({
+        runId: run.id,
+        workflowId,
+        triggerType
+      }),
+      availableAt: new Date(), // Available immediately
+      attempts: 0
+    }
+  });
+
+  // Step 6: Return the run ID to the caller
+  return { run_id: run.id };
+} 
