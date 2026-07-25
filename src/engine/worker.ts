@@ -2,6 +2,7 @@ import { prisma } from '../lib/prisma.js';
 import { buildRunContext } from './context.js';
 import { resolveTemplates, type TemplateContext } from './template.js';
 import { nodeExecutors, UnimplementedNodeTypeError } from './executors.js';
+import { loadNodeCatalog } from '../bootstrap/catalog.js';
 import type { WorkflowDefinition } from '../workflows/validation.js';
 
 type DefinitionNode = WorkflowDefinition['nodes'][number];
@@ -27,7 +28,24 @@ function nextNodeId(node: DefinitionNode, output: Record<string, unknown>): stri
   return typeof node.next === 'string' ? node.next : null;
 }
 
-async function recordFailedStep(runId: string, node: DefinitionNode, sequence: number, resolvedInput: unknown, message: string, startedAt: Date): Promise<void> {
+function buildIdempotencyKey(runId: string, nodeId: string, sequence: number): string {
+  // {run_id}:{node_id}:{sequence}. Stable across retries and resumes of one
+  // node attempt (sequence is only assigned once, before the first try, and
+  // doesn't advance until the step succeeds) - but distinct per loop
+  // iteration (each iteration gets its own sequence), so a backward jump
+  // that revisits the same node id is treated as a new side effect.
+  return `${runId}:${nodeId}:${sequence}`;
+}
+
+async function recordFailedStep(
+  runId: string,
+  node: DefinitionNode,
+  sequence: number,
+  resolvedInput: unknown,
+  message: string,
+  startedAt: Date,
+  idempotencyKey?: string
+): Promise<void> {
   await prisma.step.create({
     data: {
       runId,
@@ -38,6 +56,7 @@ async function recordFailedStep(runId: string, node: DefinitionNode, sequence: n
       attempt: 1,
       resolvedInput: JSON.stringify(resolvedInput),
       output: JSON.stringify({ error: message }),
+      idempotencyKey: idempotencyKey ?? null,
       startedAt,
       durationMs: Date.now() - startedAt.getTime()
     }
@@ -65,6 +84,9 @@ export async function runOnce(runId: string): Promise<void> {
   const definition = JSON.parse(run.definitionSnapshot) as WorkflowDefinition;
   const nodeMap = new Map(definition.nodes.map((node) => [node.id, node]));
   const maxSteps = getMaxSteps(definition);
+
+  const catalog = await loadNodeCatalog();
+  const sideEffectNodeTypes = new Set(catalog.nodes.filter((n) => n.side_effect).map((n) => n.type));
 
   if (run.status === 'queued') {
     await prisma.run.update({ where: { id: run.id }, data: { status: 'running' } });
@@ -107,12 +129,19 @@ export async function runOnce(runId: string): Promise<void> {
       return;
     }
 
+    // Computed before the call, from persisted state alone, so a resume
+    // after a crash recomputes the exact same key for the same attempt.
+    const idempotencyKey = buildIdempotencyKey(run.id, node.id, sequence);
+
     let result;
     try {
-      result = await executor(resolvedInput);
+      result = await executor(resolvedInput, { idempotencyKey });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await recordFailedStep(run.id, node, sequence, resolvedInput, message, startedAt);
+      // Only recorded for node types the catalog marks as side-effecting -
+      // the key was never actually sent anywhere for e.g. a failed condition.
+      const failedKey = sideEffectNodeTypes.has(node.type) ? idempotencyKey : undefined;
+      await recordFailedStep(run.id, node, sequence, resolvedInput, message, startedAt, failedKey);
       await failRun(run.id, message, sequence);
       return;
     }
@@ -129,6 +158,7 @@ export async function runOnce(runId: string): Promise<void> {
         attempt: 1,
         resolvedInput: JSON.stringify(resolvedInput),
         output: JSON.stringify(result.output),
+        idempotencyKey: result.idempotencyKey ?? null,
         startedAt,
         durationMs: Date.now() - startedAt.getTime()
       }
@@ -190,10 +220,29 @@ export async function pollQueueOnce(): Promise<boolean> {
   return true;
 }
 
+/**
+ * A job stuck in `running` past a worker's lifetime is the crash signature:
+ * something claimed it and never finished. Reset it to `queued` so it's
+ * picked up again - the run itself resumes correctly from its persisted
+ * currentNodeId/stepsExecuted regardless of why runOnce is being re-invoked.
+ */
+export async function reclaimInFlightJobs(): Promise<number> {
+  const result = await prisma.queueJob.updateMany({
+    where: { type: 'run_step', status: 'running' },
+    data: { status: 'queued', lockedAt: null, availableAt: new Date() }
+  });
+  return result.count;
+}
+
 export function startWorker(intervalMs = 500): () => void {
   let stopped = false;
 
   void (async function loop() {
+    const reclaimed = await reclaimInFlightJobs();
+    if (reclaimed > 0) {
+      console.log(`Worker reclaimed ${reclaimed} in-flight job(s) left over from a previous run`);
+    }
+
     while (!stopped) {
       let worked = false;
       try {

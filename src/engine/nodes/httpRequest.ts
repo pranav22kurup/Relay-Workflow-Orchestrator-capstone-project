@@ -1,7 +1,10 @@
 import { config } from '../../config.js';
 import { requestWithTimeout } from '../httpClient.js';
+import type { NodeExecutionContext, NodeExecutionResult } from '../executors.js';
 
 const METHODS_WITH_BODY = new Set(['POST', 'PUT', 'DELETE']);
+// Only mutating calls are side effects per the catalog; GET stays replay-free.
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'DELETE']);
 
 export class HttpRequestParamsError extends Error {}
 
@@ -10,7 +13,10 @@ export class HttpRequestParamsError extends Error {}
  * is a completed step (status + body are in the output for downstream nodes
  * to branch on); only a network failure or a timeout fails the step.
  */
-export async function executeHttpRequestNode(params: Record<string, unknown>): Promise<{ output: Record<string, unknown> }> {
+export async function executeHttpRequestNode(
+  params: Record<string, unknown>,
+  ctx: NodeExecutionContext
+): Promise<NodeExecutionResult> {
   const { method, url, headers, body } = params;
 
   if (typeof method !== 'string') {
@@ -21,7 +27,12 @@ export async function executeHttpRequestNode(params: Record<string, unknown>): P
   }
 
   const upperMethod = method.toUpperCase();
+  const isMutating = MUTATING_METHODS.has(upperMethod);
   const requestHeaders: Record<string, string> = { ...(isPlainObject(headers) ? stringifyHeaderValues(headers) : {}) };
+
+  if (isMutating) {
+    requestHeaders['Idempotency-Key'] = ctx.idempotencyKey;
+  }
 
   let requestBody: string | undefined;
   if (body !== undefined && body !== null && METHODS_WITH_BODY.has(upperMethod)) {
@@ -37,7 +48,10 @@ export async function executeHttpRequestNode(params: Record<string, unknown>): P
     config.engineHttpTimeoutMs
   );
 
-  return { output: { status: result.status, body: result.body } };
+  return {
+    output: { status: result.status, body: result.body },
+    idempotencyKey: isMutating ? ctx.idempotencyKey : undefined
+  };
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

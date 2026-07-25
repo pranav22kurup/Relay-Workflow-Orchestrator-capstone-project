@@ -1,5 +1,6 @@
 import { config } from '../../config.js';
 import { requestWithTimeout } from '../httpClient.js';
+import type { NodeExecutionContext, NodeExecutionResult } from '../executors.js';
 
 export class NotifyParamsError extends Error {}
 export class NotifyDeliveryError extends Error {}
@@ -20,7 +21,10 @@ function errorMessageFromBody(body: unknown): string | null {
  * catalog output is strictly {delivered, notification_id} - a non-2xx
  * response is a genuine step failure, not a value to branch on.
  */
-export async function executeNotifyNode(params: Record<string, unknown>): Promise<{ output: Record<string, unknown> }> {
+export async function executeNotifyNode(
+  params: Record<string, unknown>,
+  ctx: NodeExecutionContext
+): Promise<NodeExecutionResult> {
   const { channel, to, subject, message } = params;
 
   if (channel !== 'email' && channel !== 'chat') {
@@ -38,7 +42,11 @@ export async function executeNotifyNode(params: Record<string, unknown>): Promis
 
   const result = await requestWithTimeout(
     url,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': ctx.idempotencyKey },
+      body: JSON.stringify(body)
+    },
     config.engineHttpTimeoutMs
   );
 
@@ -52,6 +60,7 @@ export async function executeNotifyNode(params: Record<string, unknown>): Promis
     output: {
       delivered: Boolean(responseBody.delivered),
       notification_id: responseBody.notification_id
-    }
+    },
+    idempotencyKey: ctx.idempotencyKey
   };
 }

@@ -9,7 +9,7 @@ import { requestWithTimeout, HttpTimeoutError } from '../src/engine/httpClient.j
 import { executeHttpRequestNode } from '../src/engine/nodes/httpRequest.js';
 import { executeDelayNode, DelayParamsError } from '../src/engine/nodes/delay.js';
 import { executeNotifyNode, NotifyParamsError, NotifyDeliveryError } from '../src/engine/nodes/notify.js';
-import { runOnce, pollQueueOnce } from '../src/engine/worker.js';
+import { runOnce, pollQueueOnce, reclaimInFlightJobs } from '../src/engine/worker.js';
 
 async function setMockWorldConfig(overrides: Partial<{ mode: string; fail_rate: number; latency_ms: number }>): Promise<void> {
   await fetch(`${config.mockWorldUrl}/admin/config`, {
@@ -110,14 +110,22 @@ test('executeHttpRequestNode passes through a non-2xx response instead of throwi
   assert.equal(result.output.status, 404);
 });
 
-test('executeHttpRequestNode sends a JSON body on mutating methods', async () => {
-  const result = await executeHttpRequestNode({
-    method: 'POST',
-    url: `${config.mockWorldUrl}/shipments`,
-    body: { order_id: 'ord_2002' }
-  });
+test('executeHttpRequestNode sends a JSON body and an Idempotency-Key on mutating methods', async () => {
+  const result = await executeHttpRequestNode(
+    { method: 'POST', url: `${config.mockWorldUrl}/shipments`, body: { order_id: 'ord_2002' } },
+    { idempotencyKey: 'test-run:create_shipment:1' }
+  );
   assert.equal(result.output.status, 201);
   assert.equal((result.output.body as Record<string, unknown>).order_id, 'ord_2002');
+  assert.equal(result.idempotencyKey, 'test-run:create_shipment:1');
+});
+
+test('executeHttpRequestNode does not attach an idempotency key to a GET', async () => {
+  const result = await executeHttpRequestNode(
+    { method: 'GET', url: `${config.mockWorldUrl}/health` },
+    { idempotencyKey: 'test-run:health_check:1' }
+  );
+  assert.equal(result.idempotencyKey, undefined);
 });
 
 test('requestWithTimeout fails the call (not the process) when the dependency hangs', async () => {
@@ -134,38 +142,63 @@ test('requestWithTimeout fails the call (not the process) when the dependency ha
   }
 });
 
-test('executeNotifyNode delivers an email through the mock world', async () => {
-  const result = await executeNotifyNode({
-    channel: 'email',
-    to: 'someone@example.com',
-    subject: 'Hello',
-    message: 'World'
-  });
+test('executeNotifyNode delivers an email through the mock world with a stable idempotency key', async () => {
+  const result = await executeNotifyNode(
+    { channel: 'email', to: 'someone@example.com', subject: 'Hello', message: 'World' },
+    { idempotencyKey: 'test-run:notify_customer:1' }
+  );
   assert.equal(result.output.delivered, true);
   assert.match(String(result.output.notification_id), /^eml_/);
+  assert.equal(result.idempotencyKey, 'test-run:notify_customer:1');
 });
 
 test('executeNotifyNode delivers a chat message through the mock world', async () => {
-  const result = await executeNotifyNode({ channel: 'chat', to: '#ops', message: 'hello' });
+  const result = await executeNotifyNode(
+    { channel: 'chat', to: '#ops', message: 'hello' },
+    { idempotencyKey: 'test-run:notify_ops:1' }
+  );
   assert.equal(result.output.delivered, true);
   assert.match(String(result.output.notification_id), /^msg_/);
 });
 
 test('executeNotifyNode rejects malformed params before making a network call', async () => {
-  await assert.rejects(() => executeNotifyNode({ channel: 'sms', to: 'x', message: 'y' }), NotifyParamsError);
-  await assert.rejects(() => executeNotifyNode({ channel: 'email', message: 'y' }), NotifyParamsError);
+  const ctx = { idempotencyKey: 'test-run:notify_bad:1' };
+  await assert.rejects(() => executeNotifyNode({ channel: 'sms', to: 'x', message: 'y' }, ctx), NotifyParamsError);
+  await assert.rejects(() => executeNotifyNode({ channel: 'email', message: 'y' }, ctx), NotifyParamsError);
 });
 
 test('executeNotifyNode fails cleanly when the mock world rejects the call', async () => {
   await setMockWorldConfig({ fail_rate: 1 });
   try {
     await assert.rejects(
-      () => executeNotifyNode({ channel: 'chat', to: '#ops', message: 'hello' }),
+      () => executeNotifyNode({ channel: 'chat', to: '#ops', message: 'hello' }, { idempotencyKey: 'test-run:notify_fail:1' }),
       NotifyDeliveryError
     );
   } finally {
     await resetMockWorldConfig();
   }
+});
+
+test('executeNotifyNode replays instead of duplicating when the same idempotency key is reused', async () => {
+  const ctx = { idempotencyKey: `test-run:notify_replay:${Date.now()}` };
+  const params = { channel: 'chat' as const, to: '#idempotency-test', message: 'first send' };
+
+  const first = await executeNotifyNode(params, ctx);
+  const second = await executeNotifyNode(params, ctx);
+
+  assert.equal(first.output.delivered, true);
+  assert.equal(second.output.delivered, true);
+  // The mock world returns the original stored response on a replayed key,
+  // so both calls resolve to the exact same notification_id - proof the
+  // side effect fired once even though the executor was invoked twice.
+  assert.equal(first.output.notification_id, second.output.notification_id);
+
+  const ledgerResponse = await fetch(`${config.mockWorldUrl}/admin/ledger`);
+  const ledger = (await ledgerResponse.json()) as { entries: Array<{ idempotency_key: string; replayed: boolean }> };
+  const matching = ledger.entries.filter((entry) => entry.idempotency_key === ctx.idempotencyKey);
+  assert.equal(matching.length, 2);
+  assert.equal(matching[0].replayed, false);
+  assert.equal(matching[1].replayed, true);
 });
 
 // --- worker loop (integration, against the real dev database) -----------
@@ -439,6 +472,186 @@ test('pollQueueOnce claims a queued job off the real queue and drives the run to
 
     assert.equal(current.status, 'done');
 
+    const finishedRun = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+    assert.equal(finishedRun.status, 'succeeded');
+  } finally {
+    await prisma.queueJob.delete({ where: { id: job.id } }).catch(() => {});
+    await cleanupWorkflow(definition.id);
+  }
+});
+
+// --- crash recovery and idempotency (Day 7) ------------------------------
+
+test('runOnce resumes from currentNodeId without re-executing already-completed steps', async () => {
+  const definition: TestDefinition = {
+    id: 'wf_engine_test_resume',
+    name: 'Engine test resume',
+    trigger: { type: 'manual' },
+    entry: 'first',
+    limits: { max_steps: 10 },
+    nodes: [
+      { id: 'first', type: 'condition', params: { left: '1', op: 'equals', right: '1' }, on_true: 'second', on_false: 'second' },
+      { id: 'second', type: 'condition', params: { left: '2', op: 'equals', right: '2' }, on_true: null, on_false: null }
+    ]
+  };
+
+  await seedTestWorkflow(definition);
+  const run = await seedTestRun(definition, {});
+
+  // Simulate exactly what a restarted worker finds after a crash right
+  // after 'first' was persisted: a Step row for it, and the run pointer
+  // already advanced past it.
+  await prisma.step.create({
+    data: {
+      runId: run.id,
+      nodeId: 'first',
+      nodeType: 'condition',
+      sequence: 1,
+      status: 'succeeded',
+      attempt: 1,
+      resolvedInput: JSON.stringify({ left: '1', op: 'equals', right: '1' }),
+      output: JSON.stringify({ result: true }),
+      startedAt: new Date(),
+      durationMs: 1
+    }
+  });
+  await prisma.run.update({ where: { id: run.id }, data: { status: 'running', currentNodeId: 'second', stepsExecuted: 1 } });
+
+  try {
+    await runOnce(run.id);
+
+    const steps = await prisma.step.findMany({ where: { runId: run.id }, orderBy: { sequence: 'asc' } });
+    assert.equal(steps.length, 2);
+    assert.equal(steps.filter((step) => step.nodeId === 'first').length, 1, "'first' must not be re-executed");
+    assert.equal(steps[1].nodeId, 'second');
+    assert.equal(steps[1].sequence, 2);
+
+    const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+    assert.equal(finished.status, 'succeeded');
+  } finally {
+    await cleanupWorkflow(definition.id);
+  }
+});
+
+test('a resumed run reuses the same idempotency key, so a side effect that already fired is not duplicated', async () => {
+  const definition: TestDefinition = {
+    id: 'wf_engine_test_crash_window',
+    name: 'Engine test crash window',
+    trigger: { type: 'manual' },
+    entry: 'notify_once',
+    limits: { max_steps: 10 },
+    nodes: [
+      {
+        id: 'notify_once',
+        type: 'notify',
+        params: { channel: 'chat', to: '#crash-window-test', message: 'ping' },
+        next: null
+      }
+    ]
+  };
+
+  await seedTestWorkflow(definition);
+  const run = await seedTestRun(definition, {});
+
+  // The engine would compute this exact key for the (only) attempt at
+  // 'notify_once': sequence = stepsExecuted(0) + 1.
+  const expectedKey = `${run.id}:notify_once:1`;
+
+  // Simulate the crash window from DATA_MODEL.md: the side effect already
+  // fired against the mock world, but the worker died before the Step row
+  // was persisted - so no Step exists yet for this node.
+  const preCrashCall = await executeNotifyNode(
+    { channel: 'chat', to: '#crash-window-test', message: 'ping' },
+    { idempotencyKey: expectedKey }
+  );
+
+  try {
+    // A restarted worker resumes the same run from scratch.
+    await runOnce(run.id);
+
+    const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+    assert.equal(finished.status, 'succeeded');
+
+    const steps = await prisma.step.findMany({ where: { runId: run.id } });
+    assert.equal(steps.length, 1);
+    assert.equal(steps[0].idempotencyKey, expectedKey);
+
+    // Same notification_id as the pre-crash call: the mock world absorbed
+    // the resumed attempt as a replay instead of sending a second message.
+    const resumedOutput = JSON.parse(steps[0].output ?? '{}') as { notification_id: string };
+    assert.equal(resumedOutput.notification_id, preCrashCall.output.notification_id);
+
+    const ledgerResponse = await fetch(`${config.mockWorldUrl}/admin/ledger`);
+    const ledger = (await ledgerResponse.json()) as { entries: Array<{ idempotency_key: string; replayed: boolean }> };
+    const matching = ledger.entries.filter((entry) => entry.idempotency_key === expectedKey);
+    assert.equal(matching.length, 2, 'exactly one real send and one replay');
+    assert.equal(matching[0].replayed, false);
+    assert.equal(matching[1].replayed, true);
+  } finally {
+    await cleanupWorkflow(definition.id);
+  }
+});
+
+test('reclaimInFlightJobs resets jobs stuck in running back to queued', async () => {
+  const job = await prisma.queueJob.create({
+    data: {
+      type: 'run_step',
+      status: 'running',
+      payload: JSON.stringify({ runId: 'does-not-matter' }),
+      availableAt: new Date(),
+      lockedAt: new Date()
+    }
+  });
+
+  try {
+    const reclaimed = await reclaimInFlightJobs();
+    assert.ok(reclaimed >= 1);
+
+    const after = await prisma.queueJob.findUniqueOrThrow({ where: { id: job.id } });
+    assert.equal(after.status, 'queued');
+    assert.equal(after.lockedAt, null);
+  } finally {
+    await prisma.queueJob.delete({ where: { id: job.id } }).catch(() => {});
+  }
+});
+
+test('reclaim + poll fully recovers a run whose job was orphaned by a crashed worker', async () => {
+  const definition: TestDefinition = {
+    id: 'wf_engine_test_orphaned_job',
+    name: 'Engine test orphaned job',
+    trigger: { type: 'manual' },
+    entry: 'gate',
+    limits: { max_steps: 10 },
+    nodes: [{ id: 'gate', type: 'condition', params: { left: '1', op: 'equals', right: '1' }, on_true: null, on_false: null }]
+  };
+
+  await seedTestWorkflow(definition);
+  const run = await seedTestRun(definition, {});
+  // A job left 'running' with no worker left alive to finish it - exactly
+  // the state a crash leaves behind.
+  const job = await prisma.queueJob.create({
+    data: {
+      type: 'run_step',
+      status: 'running',
+      payload: JSON.stringify({ runId: run.id, workflowId: definition.id, triggerType: 'manual' }),
+      availableAt: new Date(),
+      lockedAt: new Date()
+    }
+  });
+
+  try {
+    await reclaimInFlightJobs();
+
+    let current = await prisma.queueJob.findUniqueOrThrow({ where: { id: job.id } });
+    assert.equal(current.status, 'queued');
+
+    for (let i = 0; i < 20 && current.status === 'queued'; i += 1) {
+      const worked = await pollQueueOnce();
+      current = await prisma.queueJob.findUniqueOrThrow({ where: { id: job.id } });
+      if (!worked) break;
+    }
+
+    assert.equal(current.status, 'done');
     const finishedRun = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
     assert.equal(finishedRun.status, 'succeeded');
   } finally {
