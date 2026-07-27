@@ -10,6 +10,7 @@ import { executeHttpRequestNode } from '../src/engine/nodes/httpRequest.js';
 import { executeDelayNode, DelayParamsError } from '../src/engine/nodes/delay.js';
 import { executeNotifyNode, NotifyParamsError, NotifyDeliveryError } from '../src/engine/nodes/notify.js';
 import { runOnce, pollQueueOnce, reclaimInFlightJobs } from '../src/engine/worker.js';
+import { withRetries } from '../src/engine/retry.js';
 
 async function setMockWorldConfig(overrides: Partial<{ mode: string; fail_rate: number; latency_ms: number }>): Promise<void> {
   await fetch(`${config.mockWorldUrl}/admin/config`, {
@@ -264,11 +265,11 @@ test('runOnce executes chained condition nodes and persists each step', async ()
         on_false: 'unsupported'
       },
       {
-        // 'approval' isn't implemented until Day 9 - used here purely to
-        // prove the loop fails cleanly at a not-yet-implemented node type.
+        // 'ai' isn't implemented until Day 10 - used here purely to prove
+        // the loop fails cleanly at a not-yet-implemented node type.
         id: 'unsupported',
-        type: 'approval',
-        params: { message: 'done' },
+        type: 'ai',
+        params: { prompt: 'done', output_schema: { type: 'object' } },
         next: null
       }
     ]
@@ -282,7 +283,7 @@ test('runOnce executes chained condition nodes and persists each step', async ()
 
     const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
     assert.equal(finished.status, 'failed');
-    assert.match(finished.error ?? '', /No executor implemented yet for node type 'approval'/);
+    assert.match(finished.error ?? '', /No executor implemented yet for node type 'ai'/);
     assert.equal(finished.stepsExecuted, 3);
 
     const steps = await prisma.step.findMany({ where: { runId: run.id }, orderBy: { sequence: 'asc' } });
@@ -657,5 +658,209 @@ test('reclaim + poll fully recovers a run whose job was orphaned by a crashed wo
   } finally {
     await prisma.queueJob.delete({ where: { id: job.id } }).catch(() => {});
     await cleanupWorkflow(definition.id);
+  }
+});
+
+// --- retry/backoff helper (Day 8) -----------------------------------------
+
+test('withRetries does not retry an error the caller marks non-retryable', async () => {
+  let calls = 0;
+  const result = await withRetries(
+    async () => {
+      calls += 1;
+      throw new Error('permanent');
+    },
+    { maxAttempts: 5, baseDelayMs: 5, maxDelayMs: 50, isRetryable: () => false }
+  );
+  assert.equal(result.outcome, 'failed');
+  assert.equal(result.attempts, 1);
+  assert.equal(calls, 1);
+});
+
+test('withRetries retries transient failures with exponential backoff until success', async () => {
+  let calls = 0;
+  const delays: number[] = [];
+  const result = await withRetries(
+    async () => {
+      calls += 1;
+      if (calls < 3) {
+        throw new Error('transient');
+      }
+      return 'ok';
+    },
+    {
+      maxAttempts: 5,
+      baseDelayMs: 10,
+      maxDelayMs: 1000,
+      isRetryable: () => true,
+      onRetry: (_attempt, _error, delayMs) => delays.push(delayMs)
+    }
+  );
+  assert.deepEqual(result, { outcome: 'success', value: 'ok', attempts: 3 });
+  assert.deepEqual(delays, [10, 20]);
+});
+
+test('withRetries fails after exhausting maxAttempts', async () => {
+  let calls = 0;
+  const result = await withRetries(
+    async () => {
+      calls += 1;
+      throw new Error('always fails');
+    },
+    { maxAttempts: 3, baseDelayMs: 5, maxDelayMs: 50, isRetryable: () => true }
+  );
+  assert.equal(result.outcome, 'failed');
+  assert.equal(result.attempts, 3);
+  assert.equal(calls, 3);
+});
+
+test('withRetries caps backoff delay at maxDelayMs', async () => {
+  const delays: number[] = [];
+  await withRetries(
+    async () => {
+      throw new Error('always fails');
+    },
+    { maxAttempts: 4, baseDelayMs: 100, maxDelayMs: 150, isRetryable: () => true, onRetry: (_a, _e, d) => delays.push(d) }
+  );
+  assert.deepEqual(delays, [100, 150, 150]);
+});
+
+// --- retries wired into the worker (Day 8) --------------------------------
+
+test('runOnce does not retry a non-transient error - fails on the first attempt, no backoff delay', async () => {
+  const definition: TestDefinition = {
+    id: 'wf_engine_test_no_retry_bad_params',
+    name: 'Engine test no retry on bad params',
+    trigger: { type: 'manual' },
+    entry: 'bad_delay',
+    limits: { max_steps: 10 },
+    nodes: [{ id: 'bad_delay', type: 'delay', params: { seconds: -5 }, next: null }]
+  };
+
+  await seedTestWorkflow(definition);
+  const run = await seedTestRun(definition, {});
+
+  try {
+    const startedAt = Date.now();
+    await runOnce(run.id);
+    const elapsedMs = Date.now() - startedAt;
+
+    const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+    assert.equal(finished.status, 'failed');
+
+    const steps = await prisma.step.findMany({ where: { runId: run.id } });
+    assert.equal(steps.length, 1);
+    assert.equal(steps[0].attempt, 1);
+    assert.ok(elapsedMs < 150, `a non-retryable error should fail immediately (took ${elapsedMs}ms)`);
+  } finally {
+    await cleanupWorkflow(definition.id);
+  }
+});
+
+test('runOnce exhausts retries and fails cleanly on a persistent transient failure', async () => {
+  await setMockWorldConfig({ mode: 'down' });
+
+  const definition: TestDefinition = {
+    id: 'wf_engine_test_retry_exhausted',
+    name: 'Engine test retry exhausted',
+    trigger: { type: 'manual' },
+    entry: 'notify_down',
+    limits: { max_steps: 10 },
+    nodes: [{ id: 'notify_down', type: 'notify', params: { channel: 'chat', to: '#down-test', message: 'hi' }, next: null }]
+  };
+
+  await seedTestWorkflow(definition);
+  const run = await seedTestRun(definition, {});
+
+  try {
+    await runOnce(run.id);
+
+    const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+    assert.equal(finished.status, 'failed');
+    assert.match(finished.error ?? '', /status 503/);
+
+    const steps = await prisma.step.findMany({ where: { runId: run.id } });
+    assert.equal(steps.length, 1);
+    assert.equal(steps[0].status, 'failed');
+    assert.equal(steps[0].attempt, config.nodeMaxAttempts);
+  } finally {
+    await resetMockWorldConfig();
+    await cleanupWorkflow(definition.id);
+  }
+});
+
+test('a notify node recovers from a transient outage within its retry budget', async () => {
+  // Mock world goes down for a short window, then recovers on its own - the
+  // retry loop's backoff should carry a later attempt past the outage.
+  await setMockWorldConfig({ mode: 'down' });
+  const revertTimer = setTimeout(() => {
+    void resetMockWorldConfig();
+  }, 100);
+
+  const definition: TestDefinition = {
+    id: 'wf_engine_test_retry_recovery',
+    name: 'Engine test retry recovery',
+    trigger: { type: 'manual' },
+    entry: 'notify_flaky',
+    limits: { max_steps: 10 },
+    nodes: [{ id: 'notify_flaky', type: 'notify', params: { channel: 'chat', to: '#retry-test', message: 'hi' }, next: null }]
+  };
+
+  await seedTestWorkflow(definition);
+  const run = await seedTestRun(definition, {});
+
+  try {
+    await runOnce(run.id);
+
+    const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+    assert.equal(finished.status, 'succeeded');
+
+    const steps = await prisma.step.findMany({ where: { runId: run.id } });
+    assert.equal(steps.length, 1);
+    assert.equal(steps[0].status, 'succeeded');
+    assert.ok(steps[0].attempt > 1, 'should have needed more than one attempt while the outage was active');
+  } finally {
+    clearTimeout(revertTimer);
+    await resetMockWorldConfig();
+    await cleanupWorkflow(definition.id);
+  }
+});
+
+// --- step cap against the real wf_runaway definition (Day 8) --------------
+
+test('wf_runaway is stopped by the step cap, with the failure naming the cap', async () => {
+  const seedRaw = await readFile(new URL('../data/seed_workflows.json', import.meta.url), 'utf8');
+  const seed = JSON.parse(seedRaw) as { workflows: Array<{ id: string } & Record<string, unknown>> };
+  const definition = seed.workflows.find((wf) => wf.id === 'wf_runaway');
+  assert.ok(definition, 'wf_runaway must exist in the seed data');
+
+  const run = await prisma.run.create({
+    data: {
+      workflowId: definition!.id,
+      triggerType: 'manual',
+      definitionSnapshot: JSON.stringify(definition),
+      input: JSON.stringify({}),
+      status: 'queued',
+      currentNodeId: definition!.entry as string,
+      stepsExecuted: 0
+    }
+  });
+
+  try {
+    await runOnce(run.id);
+
+    const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+    assert.equal(finished.status, 'failed');
+    assert.match(finished.error ?? '', /Step cap exceeded/);
+    assert.match(finished.error ?? '', /limits\.max_steps/);
+    assert.equal(finished.stepsExecuted, 12);
+
+    const steps = await prisma.step.findMany({ where: { runId: run.id }, orderBy: { sequence: 'asc' } });
+    assert.equal(steps.length, 12);
+    assert.ok(steps.every((step) => step.status === 'succeeded'), 'every step up to the cap should have succeeded on its own terms');
+    // 12 steps / 3 nodes-per-iteration (check_order, is_shipped, hold) = 4 full loop iterations.
+    assert.equal(steps.filter((step) => step.nodeId === 'check_order').length, 4);
+  } finally {
+    await prisma.run.delete({ where: { id: run.id } }).catch(() => {});
   }
 });

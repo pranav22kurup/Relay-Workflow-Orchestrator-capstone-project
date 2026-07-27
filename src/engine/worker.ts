@@ -3,6 +3,10 @@ import { buildRunContext } from './context.js';
 import { resolveTemplates, type TemplateContext } from './template.js';
 import { nodeExecutors, UnimplementedNodeTypeError } from './executors.js';
 import { loadNodeCatalog } from '../bootstrap/catalog.js';
+import { config } from '../config.js';
+import { withRetries } from './retry.js';
+import { HttpTimeoutError, HttpNetworkError } from './httpClient.js';
+import { NotifyDeliveryError } from './nodes/notify.js';
 import type { WorkflowDefinition } from '../workflows/validation.js';
 
 type DefinitionNode = WorkflowDefinition['nodes'][number];
@@ -28,6 +32,22 @@ function nextNodeId(node: DefinitionNode, output: Record<string, unknown>): stri
   return typeof node.next === 'string' ? node.next : null;
 }
 
+/**
+ * Only errors that are genuinely transient (timeouts, network failures, 5xx
+ * from the mock world) consume a retry. A bad param, a broken template, or a
+ * 4xx business-rule rejection (already refunded, amount too high) will fail
+ * identically on the next attempt, so those fail on the first try.
+ */
+function isRetryableNodeError(error: unknown): boolean {
+  if (error instanceof HttpTimeoutError || error instanceof HttpNetworkError) {
+    return true;
+  }
+  if (error instanceof NotifyDeliveryError) {
+    return error.status >= 500;
+  }
+  return false;
+}
+
 function buildIdempotencyKey(runId: string, nodeId: string, sequence: number): string {
   // {run_id}:{node_id}:{sequence}. Stable across retries and resumes of one
   // node attempt (sequence is only assigned once, before the first try, and
@@ -44,6 +64,7 @@ async function recordFailedStep(
   resolvedInput: unknown,
   message: string,
   startedAt: Date,
+  attempt: number,
   idempotencyKey?: string
 ): Promise<void> {
   await prisma.step.create({
@@ -53,7 +74,7 @@ async function recordFailedStep(
       nodeType: node.type,
       sequence,
       status: 'failed',
-      attempt: 1,
+      attempt,
       resolvedInput: JSON.stringify(resolvedInput),
       output: JSON.stringify({ error: message }),
       idempotencyKey: idempotencyKey ?? null,
@@ -68,6 +89,126 @@ async function failRun(runId: string, message: string, stepsExecuted: number): P
     where: { id: runId },
     data: { status: 'failed', error: message, finishedAt: new Date(), stepsExecuted }
   });
+}
+
+type ApprovalNodeOutcome = { stepsExecuted: number; nextNodeId: string | null };
+
+/**
+ * The `approval` node doesn't return a result the way other executors do -
+ * it pauses the run until a human decides. This handles both halves of that
+ * lifecycle from the same call site, so a resume (approve/reject re-enqueue,
+ * or a crash reclaim while still pending) always lands here again and
+ * re-derives what to do from persisted Approval/Step state, never from
+ * anything held in memory between calls.
+ *
+ * Returns undefined when there's nothing more for runOnce to do this call
+ * (freshly paused, still pending, or the run just ended via rejection).
+ * Returns the next node to advance to (or null, meaning the run just
+ * succeeded) once a decision has been recorded.
+ */
+async function handleApprovalNode(
+  runId: string,
+  node: DefinitionNode,
+  context: TemplateContext,
+  stepsExecuted: number
+): Promise<ApprovalNodeOutcome | undefined> {
+  const existingApproval = await prisma.approval.findFirst({
+    where: { runId, nodeId: node.id },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  if (!existingApproval) {
+    const startedAt = new Date();
+    const sequence = stepsExecuted + 1;
+
+    let resolvedInput: Record<string, unknown>;
+    try {
+      resolvedInput = resolveTemplates(node.params ?? {}, context) as Record<string, unknown>;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await recordFailedStep(runId, node, sequence, node.params ?? {}, message, startedAt, 1);
+      await failRun(runId, message, sequence);
+      return undefined;
+    }
+
+    const messageText = typeof resolvedInput.message === 'string' ? resolvedInput.message : '';
+
+    await prisma.$transaction(async (tx) => {
+      const created = await tx.approval.create({
+        data: { runId, nodeId: node.id, message: messageText, status: 'pending' }
+      });
+      await tx.step.create({
+        data: {
+          runId,
+          nodeId: node.id,
+          nodeType: node.type,
+          sequence,
+          status: 'waiting',
+          attempt: 1,
+          resolvedInput: JSON.stringify(resolvedInput),
+          output: JSON.stringify({ approval_id: created.id }),
+          startedAt
+        }
+      });
+    });
+
+    await prisma.run.update({
+      where: { id: runId },
+      data: { status: 'waiting_approval', currentNodeId: node.id, stepsExecuted }
+    });
+
+    return undefined;
+  }
+
+  if (existingApproval.status === 'pending') {
+    await prisma.run.update({ where: { id: runId }, data: { status: 'waiting_approval' } });
+    return undefined;
+  }
+
+  // Decided (approved or rejected) - finalize the waiting step.
+  const waitingStep = await prisma.step.findFirst({
+    where: { runId, nodeId: node.id, status: 'waiting' },
+    orderBy: { sequence: 'desc' }
+  });
+
+  const decisionOutput = { decision: existingApproval.status, decided_by: existingApproval.decidedBy };
+  const finalizedAt = new Date();
+  let finalStepsExecuted = stepsExecuted;
+
+  if (waitingStep) {
+    await prisma.step.update({
+      where: { id: waitingStep.id },
+      data: {
+        status: 'succeeded',
+        output: JSON.stringify(decisionOutput),
+        durationMs: finalizedAt.getTime() - waitingStep.startedAt.getTime()
+      }
+    });
+    finalStepsExecuted = waitingStep.sequence;
+  }
+
+  context.nodes[node.id] = { output: decisionOutput };
+
+  if (existingApproval.status === 'rejected') {
+    await prisma.run.update({
+      where: { id: runId },
+      data: { status: 'cancelled', error: `Approval '${node.id}' was rejected`, finishedAt: finalizedAt, stepsExecuted: finalStepsExecuted }
+    });
+    return undefined;
+  }
+
+  const nextId = typeof node.next === 'string' ? node.next : null;
+
+  if (!nextId) {
+    await prisma.run.update({
+      where: { id: runId },
+      data: { status: 'succeeded', currentNodeId: null, stepsExecuted: finalStepsExecuted, finishedAt: finalizedAt }
+    });
+    return { stepsExecuted: finalStepsExecuted, nextNodeId: null };
+  }
+
+  await prisma.run.update({ where: { id: runId }, data: { currentNodeId: nextId, stepsExecuted: finalStepsExecuted } });
+  return { stepsExecuted: finalStepsExecuted, nextNodeId: nextId };
 }
 
 /**
@@ -87,8 +228,12 @@ export async function runOnce(runId: string): Promise<void> {
 
   const catalog = await loadNodeCatalog();
   const sideEffectNodeTypes = new Set(catalog.nodes.filter((n) => n.side_effect).map((n) => n.type));
+  const approvalRequiredNodeTypes = new Set(catalog.nodes.filter((n) => n.requires_approval).map((n) => n.type));
 
-  if (run.status === 'queued') {
+  // A resumed run (after an approve/reject re-enqueue, or after a crash
+  // reclaim) is actively being processed again, so it's 'running' - even if
+  // it was 'waiting_approval' a moment ago.
+  if (run.status === 'queued' || run.status === 'waiting_approval') {
     await prisma.run.update({ where: { id: run.id }, data: { status: 'running' } });
   }
 
@@ -97,6 +242,14 @@ export async function runOnce(runId: string): Promise<void> {
   let stepsExecuted = run.stepsExecuted;
 
   while (currentNodeId) {
+    // Cooperative cancellation: checked between steps, not mid-step. A run
+    // cancelled by the API while this loop was mid-step is picked up here,
+    // before the *next* node starts - the in-flight step is left to finish.
+    const liveRun = await prisma.run.findUnique({ where: { id: run.id }, select: { status: true } });
+    if (!liveRun || liveRun.status === 'cancelled') {
+      return;
+    }
+
     if (stepsExecuted >= maxSteps) {
       await failRun(run.id, `Step cap exceeded: run executed ${stepsExecuted} steps, limit is ${maxSteps} (limits.max_steps)`, stepsExecuted);
       return;
@@ -108,6 +261,33 @@ export async function runOnce(runId: string): Promise<void> {
       return;
     }
 
+    if (node.type === 'approval') {
+      const advanceTo = await handleApprovalNode(run.id, node, context, stepsExecuted);
+      if (advanceTo === undefined) {
+        // Paused (still pending) or ended (rejected/terminal) - nothing more to do here.
+        return;
+      }
+      stepsExecuted = advanceTo.stepsExecuted;
+      if (!advanceTo.nextNodeId) {
+        return;
+      }
+      currentNodeId = advanceTo.nextNodeId;
+      continue;
+    }
+
+    if (approvalRequiredNodeTypes.has(node.type)) {
+      const hasApproval = (await prisma.approval.count({ where: { runId: run.id, status: 'approved' } })) > 0;
+      if (!hasApproval) {
+        // Engine-enforced, independent of node params or any upstream AI
+        // output: nothing written to the Approval table means this cannot run.
+        const message = `Node '${node.id}' of type '${node.type}' requires an approved approval earlier in this run`;
+        const sequence = stepsExecuted + 1;
+        await recordFailedStep(run.id, node, sequence, node.params ?? {}, message, new Date(), 1);
+        await failRun(run.id, message, sequence);
+        return;
+      }
+    }
+
     const startedAt = new Date();
     const sequence = stepsExecuted + 1;
 
@@ -116,7 +296,7 @@ export async function runOnce(runId: string): Promise<void> {
       resolvedInput = resolveTemplates(node.params ?? {}, context) as Record<string, unknown>;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await recordFailedStep(run.id, node, sequence, node.params ?? {}, message, startedAt);
+      await recordFailedStep(run.id, node, sequence, node.params ?? {}, message, startedAt, 1);
       await failRun(run.id, message, sequence);
       return;
     }
@@ -124,28 +304,35 @@ export async function runOnce(runId: string): Promise<void> {
     const executor = nodeExecutors[node.type];
     if (!executor) {
       const message = new UnimplementedNodeTypeError(node.type).message;
-      await recordFailedStep(run.id, node, sequence, resolvedInput, message, startedAt);
+      await recordFailedStep(run.id, node, sequence, resolvedInput, message, startedAt, 1);
       await failRun(run.id, message, sequence);
       return;
     }
 
     // Computed before the call, from persisted state alone, so a resume
-    // after a crash recomputes the exact same key for the same attempt.
+    // after a crash - or a retry of this same attempt - recomputes the
+    // exact same key.
     const idempotencyKey = buildIdempotencyKey(run.id, node.id, sequence);
 
-    let result;
-    try {
-      result = await executor(resolvedInput, { idempotencyKey });
-    } catch (error) {
+    const retryResult = await withRetries((_attempt) => executor(resolvedInput, { idempotencyKey }), {
+      maxAttempts: config.nodeMaxAttempts,
+      baseDelayMs: config.nodeRetryBaseDelayMs,
+      maxDelayMs: config.nodeRetryMaxDelayMs,
+      isRetryable: isRetryableNodeError
+    });
+
+    if (retryResult.outcome === 'failed') {
+      const error = retryResult.error;
       const message = error instanceof Error ? error.message : String(error);
       // Only recorded for node types the catalog marks as side-effecting -
       // the key was never actually sent anywhere for e.g. a failed condition.
       const failedKey = sideEffectNodeTypes.has(node.type) ? idempotencyKey : undefined;
-      await recordFailedStep(run.id, node, sequence, resolvedInput, message, startedAt, failedKey);
+      await recordFailedStep(run.id, node, sequence, resolvedInput, message, startedAt, retryResult.attempts, failedKey);
       await failRun(run.id, message, sequence);
       return;
     }
 
+    const result = retryResult.value;
     stepsExecuted = sequence;
 
     await prisma.step.create({
@@ -155,7 +342,7 @@ export async function runOnce(runId: string): Promise<void> {
         nodeType: node.type,
         sequence,
         status: 'succeeded',
-        attempt: 1,
+        attempt: retryResult.attempts,
         resolvedInput: JSON.stringify(resolvedInput),
         output: JSON.stringify(result.output),
         idempotencyKey: result.idempotencyKey ?? null,

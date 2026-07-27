@@ -4,6 +4,8 @@ import morgan from 'morgan';
 import { requireDemoToken } from './middleware/auth.js';
 import { ApiError } from './http/errors.js';
 import { createWorkflow, getWorkflow, listWorkflows, publishWorkflow, updateWorkflow, triggerWorkflow, validateSecret} from './workflows/service.js';
+import { listPendingApprovals, approveApproval, rejectApproval } from './approvals/service.js';
+import { cancelRun } from './runs/service.js';
 
 export async function createApp() {
   const app = express();
@@ -121,6 +123,49 @@ export async function createApp() {
         'manual'
       );
       response.status(202).json({ run_id: result.run_id });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // GET /approvals?status=pending
+  app.get('/approvals', async (request, response, next) => {
+    try {
+      if (request.query.status !== undefined && request.query.status !== 'pending') {
+        throw new ApiError(400, 'unsupported_approval_filter', "Only ?status=pending is supported");
+      }
+      const approvals = await listPendingApprovals();
+      response.json(approvals);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // POST /approvals/:approvalId/approve
+  app.post('/approvals/:approvalId/approve', async (request, response, next) => {
+    try {
+      const result = await approveApproval(request.params.approvalId);
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // POST /approvals/:approvalId/reject
+  app.post('/approvals/:approvalId/reject', async (request, response, next) => {
+    try {
+      const result = await rejectApproval(request.params.approvalId);
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // POST /runs/:runId/cancel
+  app.post('/runs/:runId/cancel', async (request, response, next) => {
+    try {
+      const result = await cancelRun(request.params.runId);
+      response.json(result);
     } catch (error) {
       next(error);
     }

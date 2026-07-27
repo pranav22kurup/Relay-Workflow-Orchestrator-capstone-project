@@ -3,7 +3,15 @@ import { requestWithTimeout } from '../httpClient.js';
 import type { NodeExecutionContext, NodeExecutionResult } from '../executors.js';
 
 export class NotifyParamsError extends Error {}
-export class NotifyDeliveryError extends Error {}
+
+export class NotifyDeliveryError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 function errorMessageFromBody(body: unknown): string | null {
   if (body && typeof body === 'object' && 'error' in body) {
@@ -52,7 +60,10 @@ export async function executeNotifyNode(
 
   if (result.status < 200 || result.status >= 300) {
     const detail = errorMessageFromBody(result.body);
-    throw new NotifyDeliveryError(`notify to ${channel} '${to}' failed with status ${result.status}${detail ? `: ${detail}` : ''}`);
+    throw new NotifyDeliveryError(
+      `notify to ${channel} '${to}' failed with status ${result.status}${detail ? `: ${detail}` : ''}`,
+      result.status
+    );
   }
 
   const responseBody = (result.body ?? {}) as Record<string, unknown>;

@@ -9,6 +9,10 @@ export class HttpTimeoutError extends Error {
   }
 }
 
+// Connection refused, DNS failure, etc. - distinct from HttpTimeoutError only
+// so callers can classify both as transient without string-matching messages.
+export class HttpNetworkError extends Error {}
+
 async function parseResponseBody(response: Response): Promise<unknown> {
   const text = await response.text();
   if (!text) {
@@ -40,7 +44,7 @@ export async function requestWithTimeout(url: string, init: RequestInit, timeout
       throw new HttpTimeoutError(url, timeoutMs);
     }
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Request to '${url}' failed: ${message}`);
+    throw new HttpNetworkError(`Request to '${url}' failed: ${message}`);
   } finally {
     clearTimeout(timer);
   }
