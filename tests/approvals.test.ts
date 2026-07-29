@@ -55,6 +55,13 @@ async function cleanupWorkflow(workflowId: string): Promise<void> {
   await prisma.workflow.delete({ where: { id: workflowId } }).catch(() => {});
 }
 
+// Clears the ledger and resets seeded orders back to their original status -
+// needed before a test performs a real refund, so re-running the suite
+// doesn't hit a stale "already refunded" 409 from a previous run.
+async function resetMockWorldState(): Promise<void> {
+  await fetch(`${config.mockWorldUrl}/admin/reset`, { method: 'POST' });
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -273,6 +280,8 @@ test('a requires_approval node is blocked by the engine when no approval was eve
 });
 
 test('a requires_approval node proceeds past the gate once an approval was granted earlier in the run', async () => {
+  await resetMockWorldState();
+
   const definition: TestDefinition = {
     id: 'wf_approvals_test_gate_passed',
     name: 'Approvals test gate passed',
@@ -297,14 +306,15 @@ test('a requires_approval node proceeds past the gate once an approval was grant
     for (let i = 0; i < 20 && worked; i += 1) {
       worked = await pollQueueOnce();
       const current = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
-      if (current.status === 'failed') break;
+      if (current.status === 'succeeded' || current.status === 'failed') break;
     }
 
     const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
-    // order_action itself isn't implemented until a later day - the point
-    // here is that it got past the gate and failed for a *different* reason.
-    assert.equal(finished.status, 'failed');
-    assert.match(finished.error ?? '', /No executor implemented yet for node type 'order_action'/);
+    assert.equal(finished.status, 'succeeded');
+
+    const steps = await prisma.step.findMany({ where: { runId: run.id }, orderBy: { sequence: 'asc' } });
+    assert.deepEqual(steps.map((s) => s.nodeId), ['gate', 'refund']);
+    assert.deepEqual(JSON.parse(steps[1].output ?? '{}').status, 'refunded');
   } finally {
     await cleanupWorkflow(definition.id);
   }

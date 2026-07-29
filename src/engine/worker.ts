@@ -7,6 +7,8 @@ import { config } from '../config.js';
 import { withRetries } from './retry.js';
 import { HttpTimeoutError, HttpNetworkError } from './httpClient.js';
 import { NotifyDeliveryError } from './nodes/notify.js';
+import { OrderActionError } from './nodes/orderAction.js';
+import { AiProviderError } from '../ai/provider.js';
 import type { WorkflowDefinition } from '../workflows/validation.js';
 
 type DefinitionNode = WorkflowDefinition['nodes'][number];
@@ -45,7 +47,32 @@ function isRetryableNodeError(error: unknown): boolean {
   if (error instanceof NotifyDeliveryError) {
     return error.status >= 500;
   }
+  if (error instanceof OrderActionError) {
+    // 404 (unknown order), 400 (bad amount), 409 (already refunded) are
+    // permanent business-rule outcomes; 5xx is the mock world genuinely down.
+    return error.status >= 500;
+  }
+  if (error instanceof AiProviderError) {
+    // 5xx and 429 (rate limited) are worth a backoff-and-retry; a 4xx like a
+    // bad model name or an auth failure will fail identically again.
+    return error.status >= 500 || error.status === 429;
+  }
   return false;
+}
+
+/** Duck-typed: any thrown error may optionally report token spend (only the
+ * `ai` node's errors do), so this stays independent of which node type threw. */
+function extractTokenUsage(error: unknown): { tokensPrompt: number; tokensCompletion: number } | null {
+  if (
+    error &&
+    typeof error === 'object' &&
+    typeof (error as { tokensPrompt?: unknown }).tokensPrompt === 'number' &&
+    typeof (error as { tokensCompletion?: unknown }).tokensCompletion === 'number'
+  ) {
+    const withUsage = error as { tokensPrompt: number; tokensCompletion: number };
+    return { tokensPrompt: withUsage.tokensPrompt, tokensCompletion: withUsage.tokensCompletion };
+  }
+  return null;
 }
 
 function buildIdempotencyKey(runId: string, nodeId: string, sequence: number): string {
@@ -65,7 +92,8 @@ async function recordFailedStep(
   message: string,
   startedAt: Date,
   attempt: number,
-  idempotencyKey?: string
+  idempotencyKey?: string,
+  tokenUsage?: { tokensPrompt: number; tokensCompletion: number }
 ): Promise<void> {
   await prisma.step.create({
     data: {
@@ -78,16 +106,24 @@ async function recordFailedStep(
       resolvedInput: JSON.stringify(resolvedInput),
       output: JSON.stringify({ error: message }),
       idempotencyKey: idempotencyKey ?? null,
+      tokensPrompt: tokenUsage?.tokensPrompt ?? null,
+      tokensCompletion: tokenUsage?.tokensCompletion ?? null,
       startedAt,
       durationMs: Date.now() - startedAt.getTime()
     }
   });
 }
 
-async function failRun(runId: string, message: string, stepsExecuted: number): Promise<void> {
+async function failRun(runId: string, message: string, stepsExecuted: number, aiTokensUsed?: number): Promise<void> {
   await prisma.run.update({
     where: { id: runId },
-    data: { status: 'failed', error: message, finishedAt: new Date(), stepsExecuted }
+    data: {
+      status: 'failed',
+      error: message,
+      finishedAt: new Date(),
+      stepsExecuted,
+      ...(aiTokensUsed !== undefined ? { aiTokensUsed } : {})
+    }
   });
 }
 
@@ -240,6 +276,7 @@ export async function runOnce(runId: string): Promise<void> {
   const context: TemplateContext = await buildRunContext(run);
   let currentNodeId: string | null = run.currentNodeId ?? definition.entry;
   let stepsExecuted = run.stepsExecuted;
+  let aiTokensUsed = run.aiTokensUsed;
 
   while (currentNodeId) {
     // Cooperative cancellation: checked between steps, not mid-step. A run
@@ -327,13 +364,22 @@ export async function runOnce(runId: string): Promise<void> {
       // Only recorded for node types the catalog marks as side-effecting -
       // the key was never actually sent anywhere for e.g. a failed condition.
       const failedKey = sideEffectNodeTypes.has(node.type) ? idempotencyKey : undefined;
-      await recordFailedStep(run.id, node, sequence, resolvedInput, message, startedAt, retryResult.attempts, failedKey);
-      await failRun(run.id, message, sequence);
+      // Tokens may have genuinely been spent even though the step failed
+      // (e.g. two AI calls that both came back malformed) - still charge them.
+      const tokenUsage = extractTokenUsage(error);
+      if (tokenUsage) {
+        aiTokensUsed += tokenUsage.tokensPrompt + tokenUsage.tokensCompletion;
+      }
+      await recordFailedStep(run.id, node, sequence, resolvedInput, message, startedAt, retryResult.attempts, failedKey, tokenUsage ?? undefined);
+      await failRun(run.id, message, sequence, aiTokensUsed);
       return;
     }
 
     const result = retryResult.value;
     stepsExecuted = sequence;
+    if (result.tokensPrompt !== undefined || result.tokensCompletion !== undefined) {
+      aiTokensUsed += (result.tokensPrompt ?? 0) + (result.tokensCompletion ?? 0);
+    }
 
     await prisma.step.create({
       data: {
@@ -346,6 +392,8 @@ export async function runOnce(runId: string): Promise<void> {
         resolvedInput: JSON.stringify(resolvedInput),
         output: JSON.stringify(result.output),
         idempotencyKey: result.idempotencyKey ?? null,
+        tokensPrompt: result.tokensPrompt ?? null,
+        tokensCompletion: result.tokensCompletion ?? null,
         startedAt,
         durationMs: Date.now() - startedAt.getTime()
       }
@@ -358,12 +406,12 @@ export async function runOnce(runId: string): Promise<void> {
     if (!nextId) {
       await prisma.run.update({
         where: { id: run.id },
-        data: { status: 'succeeded', currentNodeId: null, stepsExecuted, finishedAt: new Date() }
+        data: { status: 'succeeded', currentNodeId: null, stepsExecuted, aiTokensUsed, finishedAt: new Date() }
       });
       return;
     }
 
-    await prisma.run.update({ where: { id: run.id }, data: { currentNodeId: nextId, stepsExecuted } });
+    await prisma.run.update({ where: { id: run.id }, data: { currentNodeId: nextId, stepsExecuted, aiTokensUsed } });
     currentNodeId = nextId;
   }
 }

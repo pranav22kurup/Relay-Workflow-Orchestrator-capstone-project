@@ -7,7 +7,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "node --test --test-concurrency=1 --import tsx tests/workflows.test.ts tests/engine.test.ts tests/approvals.test.ts",
+    "test": "node --test --test-concurrency=1 --import tsx tests/workflows.test.ts tests/engine.test.ts tests/approvals.test.ts tests/ai.test.ts tests/runs.test.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:push": "prisma db push"

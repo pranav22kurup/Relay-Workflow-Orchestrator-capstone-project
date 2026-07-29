@@ -2,12 +2,17 @@ import { executeConditionNode } from './nodes/condition.js';
 import { executeHttpRequestNode } from './nodes/httpRequest.js';
 import { executeDelayNode } from './nodes/delay.js';
 import { executeNotifyNode } from './nodes/notify.js';
+import { executeAiNode } from './nodes/ai.js';
+import { executeOrderActionNode } from './nodes/orderAction.js';
 
 export type NodeExecutionResult = {
   output: Record<string, unknown>;
   // Set by an executor only when it actually sent this key to an external
   // system, so the trace reflects real usage rather than every node type.
   idempotencyKey?: string;
+  // Set only by the `ai` node - token usage for the run trace.
+  tokensPrompt?: number;
+  tokensCompletion?: number;
 };
 
 export type NodeExecutionContext = {
@@ -28,11 +33,13 @@ export class UnimplementedNodeTypeError extends Error {
   }
 }
 
-// Deterministic node types (Must Have 4). `ai`, `approval`, and
-// `order_action` are added on their own days (8-9).
+// `approval` is handled separately in worker.ts (it pauses the run rather
+// than returning synchronously).
 export const nodeExecutors: Record<string, NodeExecutor> = {
   condition: executeConditionNode,
   http_request: executeHttpRequestNode,
   delay: executeDelayNode,
-  notify: executeNotifyNode
+  notify: executeNotifyNode,
+  ai: executeAiNode,
+  order_action: executeOrderActionNode
 };

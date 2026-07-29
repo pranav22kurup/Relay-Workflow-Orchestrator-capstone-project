@@ -5,7 +5,7 @@ import { requireDemoToken } from './middleware/auth.js';
 import { ApiError } from './http/errors.js';
 import { createWorkflow, getWorkflow, listWorkflows, publishWorkflow, updateWorkflow, triggerWorkflow, validateSecret} from './workflows/service.js';
 import { listPendingApprovals, approveApproval, rejectApproval } from './approvals/service.js';
-import { cancelRun } from './runs/service.js';
+import { cancelRun, listRuns, getRunTrace } from './runs/service.js';
 
 export async function createApp() {
   const app = express();
@@ -123,6 +123,27 @@ export async function createApp() {
         'manual'
       );
       response.status(202).json({ run_id: result.run_id });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // GET /runs?workflowId=...
+  app.get('/runs', async (request, response, next) => {
+    try {
+      const workflowId = typeof request.query.workflowId === 'string' ? request.query.workflowId : undefined;
+      const runs = await listRuns(workflowId);
+      response.json({ runs });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // GET /runs/:runId (full step trace)
+  app.get('/runs/:runId', async (request, response, next) => {
+    try {
+      const trace = await getRunTrace(request.params.runId);
+      response.json(trace);
     } catch (error) {
       next(error);
     }

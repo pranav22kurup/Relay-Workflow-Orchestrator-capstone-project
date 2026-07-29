@@ -9,6 +9,7 @@ import { requestWithTimeout, HttpTimeoutError } from '../src/engine/httpClient.j
 import { executeHttpRequestNode } from '../src/engine/nodes/httpRequest.js';
 import { executeDelayNode, DelayParamsError } from '../src/engine/nodes/delay.js';
 import { executeNotifyNode, NotifyParamsError, NotifyDeliveryError } from '../src/engine/nodes/notify.js';
+import { executeOrderActionNode, OrderActionParamsError, OrderActionError } from '../src/engine/nodes/orderAction.js';
 import { runOnce, pollQueueOnce, reclaimInFlightJobs } from '../src/engine/worker.js';
 import { withRetries } from '../src/engine/retry.js';
 
@@ -21,6 +22,13 @@ async function setMockWorldConfig(overrides: Partial<{ mode: string; fail_rate: 
 }
 
 const resetMockWorldConfig = () => setMockWorldConfig({ mode: 'ok', fail_rate: 0, latency_ms: 0 });
+
+// Clears the ledger and resets seeded orders (ord_2001/2002/2003) back to
+// their original status - needed before tests that perform a real refund,
+// so re-running the suite doesn't hit a stale "already refunded" 409.
+async function resetMockWorldState(): Promise<void> {
+  await fetch(`${config.mockWorldUrl}/admin/reset`, { method: 'POST' });
+}
 
 before(async () => {
   try {
@@ -202,6 +210,76 @@ test('executeNotifyNode replays instead of duplicating when the same idempotency
   assert.equal(matching[1].replayed, true);
 });
 
+test('executeOrderActionNode issues a full refund through the mock world', async () => {
+  await resetMockWorldState();
+  const result = await executeOrderActionNode(
+    { action: 'refund', order_id: 'ord_2001' },
+    { idempotencyKey: 'test-run:issue_refund:1' }
+  );
+  assert.equal(result.output.status, 'refunded');
+  assert.match(String(result.output.reference_id), /^ref_/);
+  assert.equal(result.idempotencyKey, 'test-run:issue_refund:1');
+});
+
+test('executeOrderActionNode issues a replacement through the mock world', async () => {
+  await resetMockWorldState();
+  const result = await executeOrderActionNode(
+    { action: 'replacement', order_id: 'ord_2002' },
+    { idempotencyKey: 'test-run:issue_replacement:1' }
+  );
+  assert.equal(result.output.status, 'replacement_created');
+  assert.match(String(result.output.reference_id), /^rpl_/);
+});
+
+test('executeOrderActionNode rejects malformed params before making a network call', async () => {
+  const ctx = { idempotencyKey: 'test-run:bad_order_action:1' };
+  await assert.rejects(() => executeOrderActionNode({ action: 'cancel', order_id: 'ord_2001' }, ctx), OrderActionParamsError);
+  await assert.rejects(() => executeOrderActionNode({ action: 'refund' }, ctx), OrderActionParamsError);
+  await assert.rejects(() => executeOrderActionNode({ action: 'refund', order_id: 'ord_2001', amount_usd: 'lots' }, ctx), OrderActionParamsError);
+});
+
+test('executeOrderActionNode surfaces a business-rule rejection (amount above order total) as a non-2xx failure', async () => {
+  await resetMockWorldState();
+  await assert.rejects(
+    () => executeOrderActionNode({ action: 'refund', order_id: 'ord_2001', amount_usd: 999999 }, { idempotencyKey: 'test-run:over_refund:1' }),
+    (error: unknown) => {
+      assert.ok(error instanceof OrderActionError);
+      assert.equal(error.status, 400);
+      return true;
+    }
+  );
+});
+
+test('executeOrderActionNode fails cleanly on an unknown order (404)', async () => {
+  await resetMockWorldState();
+  await assert.rejects(
+    () => executeOrderActionNode({ action: 'refund', order_id: 'ord_does_not_exist' }, { idempotencyKey: 'test-run:unknown_order:1' }),
+    (error: unknown) => {
+      assert.ok(error instanceof OrderActionError);
+      assert.equal(error.status, 404);
+      return true;
+    }
+  );
+});
+
+test('executeOrderActionNode replays instead of duplicating a refund when the same idempotency key is reused', async () => {
+  await resetMockWorldState();
+  const ctx = { idempotencyKey: `test-run:refund_replay:${Date.now()}` };
+  const params = { action: 'refund' as const, order_id: 'ord_2003' };
+
+  const first = await executeOrderActionNode(params, ctx);
+  const second = await executeOrderActionNode(params, ctx);
+
+  assert.equal(first.output.reference_id, second.output.reference_id, 'a resumed retry must not issue a second refund');
+
+  const ledgerResponse = await fetch(`${config.mockWorldUrl}/admin/ledger`);
+  const ledger = (await ledgerResponse.json()) as { entries: Array<{ idempotency_key: string; replayed: boolean }> };
+  const matching = ledger.entries.filter((entry) => entry.idempotency_key === ctx.idempotencyKey);
+  assert.equal(matching.length, 2);
+  assert.equal(matching[0].replayed, false);
+  assert.equal(matching[1].replayed, true);
+});
+
 // --- worker loop (integration, against the real dev database) -----------
 
 type TestDefinition = {
@@ -265,11 +343,14 @@ test('runOnce executes chained condition nodes and persists each step', async ()
         on_false: 'unsupported'
       },
       {
-        // 'ai' isn't implemented until Day 10 - used here purely to prove
-        // the loop fails cleanly at a not-yet-implemented node type.
+        // A synthetic, permanently-nonexistent type - not something that'll
+        // ever land in the catalog, so this test doesn't need retargeting
+        // every time another day implements a real node type (it already
+        // had to be moved twice: notify, then approval, as those landed).
+        // The point is just proving the loop fails cleanly at a missing executor.
         id: 'unsupported',
-        type: 'ai',
-        params: { prompt: 'done', output_schema: { type: 'object' } },
+        type: 'zzz_never_implemented',
+        params: {},
         next: null
       }
     ]
@@ -283,7 +364,7 @@ test('runOnce executes chained condition nodes and persists each step', async ()
 
     const finished = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
     assert.equal(finished.status, 'failed');
-    assert.match(finished.error ?? '', /No executor implemented yet for node type 'ai'/);
+    assert.match(finished.error ?? '', /No executor implemented yet for node type 'zzz_never_implemented'/);
     assert.equal(finished.stepsExecuted, 3);
 
     const steps = await prisma.step.findMany({ where: { runId: run.id }, orderBy: { sequence: 'asc' } });
