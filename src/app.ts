@@ -1,3 +1,4 @@
+import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
@@ -12,6 +13,13 @@ export async function createApp() {
   app.use(cors());
   app.use(express.json());
   app.use(morgan('dev'));
+
+  // The console: a static, read-and-operate SPA (workflow list, run traces,
+  // pending approvals) served from the same origin as the API, so its
+  // fetch() calls need no CORS setup. Registered before the API routes, but
+  // only intercepts requests matching an actual file in public/ - anything
+  // else (like /workflows) falls through to the routes below.
+  app.use(express.static(path.resolve(process.cwd(), 'public')));
 
   app.get('/health', (_request, response) => {
     response.json({ ok: true });
