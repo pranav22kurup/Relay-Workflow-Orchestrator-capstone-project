@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Workflow {
+  id          String         @id
+  name        String
+  description String?
+  status      String         @default("draft")
+  definition  String
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  runs        Run[]
+}
+
+model Run {
+  id                 String       @id @default(cuid())
+  workflowId         String
+  workflow           Workflow     @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  definitionSnapshot String
+  status             String       @default("queued")
+  triggerType        String
+  input              String
+  currentNodeId      String?
+  stepsExecuted      Int          @default(0)
+  aiTokensUsed       Int          @default(0)
+  error              String?
+  startedAt          DateTime     @default(now())
+  finishedAt         DateTime?
+  steps              Step[]
+  approvals          Approval[]
+}
+
+model Step {
+  id               String     @id @default(cuid())
+  runId            String
+  run              Run        @relation(fields: [runId], references: [id], onDelete: Cascade)
+  nodeId           String
+  nodeType         String
+  sequence         Int
+  status           String
+  attempt          Int
+  resolvedInput    String?
+  output           String?
+  tokensPrompt     Int?
+  tokensCompletion Int?
+  idempotencyKey   String?
+  startedAt        DateTime   @default(now())
+  durationMs       Int?
+
+  @@index([runId, sequence])
+}
+
+model Approval {
+  id         String          @id @default(cuid())
+  runId      String
+  run        Run             @relation(fields: [runId], references: [id], onDelete: Cascade)
+  nodeId     String
+  message    String
+  status     String          @default("pending")
+  decidedBy  String?
+  decidedAt  DateTime?
+  createdAt  DateTime        @default(now())
+
+  @@index([status])
+}
+
+model QueueJob {
+  id          String          @id @default(cuid())
+  type        String
+  payload     String
+  status      String          @default("queued")
+  availableAt DateTime        @default(now())
+  lockedAt    DateTime?
+  attempts    Int             @default(0)
+  error       String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([status, availableAt])
+}
