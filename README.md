@@ -4,6 +4,9 @@ Relay is a durable, AI-first workflow orchestrator: workflows are typed nodes wi
 
 Built as the Airtribe AI-First Software Engineering capstone. All Must-Have requirements are implemented and verified — see [VERIFICATION.md](VERIFICATION.md) for the current smoke test, duplication check, and test suite results.
 
+## Video Walkthrough of the working model
+https://drive.google.com/file/d/1dvQee3e7Gxx8eJi3023YAGbBLHCDzEFb/view?usp=sharing
+
 ## Stack
 
 - Node.js + TypeScript, Express
