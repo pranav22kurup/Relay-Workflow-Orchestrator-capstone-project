@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Relay Console</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Relay <span class="muted">console</span></div>
+    <div class="token-box">
+      <label for="token-input">Bearer token</label>
+      <input id="token-input" type="text" spellcheck="false" />
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="workflows">Workflows</button>
+    <button class="tab-btn" data-tab="runs">Runs</button>
+    <button class="tab-btn" data-tab="approvals">Approvals <span id="approvals-badge" class="badge" hidden>0</span></button>
+  </nav>
+
+  <div id="error-banner" class="error-banner" hidden></div>
+
+  <main>
+    <!-- Workflows -->
+    <section id="tab-workflows" class="tab-panel active">
+      <div class="panel-header">
+        <h2>Workflows</h2>
+        <button id="refresh-workflows" class="btn secondary">Refresh</button>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr><th>ID</th><th>Name</th><th>Status</th><th>Updated</th><th></th></tr>
+        </thead>
+        <tbody id="workflows-body"></tbody>
+      </table>
+    </section>
+
+    <!-- Runs -->
+    <section id="tab-runs" class="tab-panel">
+      <div id="runs-list-view">
+        <div class="panel-header">
+          <h2>Runs</h2>
+          <div class="panel-actions">
+            <input id="runs-filter-workflow" type="text" placeholder="Filter by workflow id&hellip;" />
+            <button id="refresh-runs" class="btn secondary">Refresh</button>
+          </div>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr><th>Run ID</th><th>Workflow</th><th>Status</th><th>Trigger</th><th>Steps</th><th>Started</th><th>Finished</th><th></th></tr>
+          </thead>
+          <tbody id="runs-body"></tbody>
+        </table>
+      </div>
+
+      <div id="run-detail-view" hidden>
+        <div class="panel-header">
+          <button id="back-to-runs" class="btn secondary">&larr; Back to runs</button>
+          <div class="panel-actions">
+            <button id="refresh-run-detail" class="btn secondary">Refresh</button>
+            <button id="cancel-run-btn" class="btn danger">Cancel run</button>
+          </div>
+        </div>
+        <div id="run-detail-summary" class="summary-card"></div>
+        <h3>Steps</h3>
+        <div id="run-detail-steps" class="steps-list"></div>
+      </div>
+    </section>
+
+    <!-- Approvals -->
+    <section id="tab-approvals" class="tab-panel">
+      <div class="panel-header">
+        <h2>Pending approvals</h2>
+        <button id="refresh-approvals" class="btn secondary">Refresh</button>
+      </div>
+      <div id="approvals-list" class="approvals-list"></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <div id="trigger-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h3>Trigger <span id="trigger-modal-workflow-id" class="mono"></span></h3>
+      <label for="trigger-modal-input">Input JSON</label>
+      <textarea id="trigger-modal-input" spellcheck="false"></textarea>
+      <div id="trigger-modal-error" class="modal-error" hidden></div>
+      <div class="modal-actions">
+        <button id="trigger-modal-cancel" class="btn secondary">Cancel</button>
+        <button id="trigger-modal-send" class="btn primary">Trigger</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
